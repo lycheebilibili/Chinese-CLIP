@@ -146,5 +146,15 @@ src/misc
 src/debug
 core.*
 
+# 不同步数据集
+# 忽略datapath/目录及其所有内容。
+# 注意：在.gitignore中，"datapath/"表示忽略名为datapath的文件夹及其内部所有文件和子文件夹；
+# 而"datapath"（没有斜杠）则会忽略名为datapath的文件或文件夹。
+# 通常推荐加斜杠以明确只忽略目录。
+# Ignore the 'datapath' directory and all its contents from version control.
+# Note: In .gitignore, both 'datapath' and 'datapath/' will ignore the directory and its contents.
+# The trailing slash is optional for directories, but can clarify intent.
+datapath/
+
 # Allow
 !src/evaluation/misc/results_dbs/*

@@ -185,10 +185,21 @@ pip install cn_clip
 # 或者从源代码安装
 cd Chinese-CLIP
 pip install -e .
+    # .：表示「当前工作目录」，告诉 pip 要安装的项目就在你现在打开的终端（命令行）所在的目录下。
+    # -e：是 --editable 的缩写，翻译为「可编辑的」，这是这个命令的核心参数，开启「可编辑安装模式」
+'''
+普通安装 pip install .：会把项目的代码和依赖打包，复制到 Python 的全局包目录（比如 site-packages）中，之后你修改本地项目代码，全局环境中的包不会同步更新，必须重新执行 pip install . 才会生效。
+可编辑安装 pip install -e .：不会复制代码到全局包目录，而是在全局包目录中创建一个「软链接」（类似 Windows 的快捷方式、Linux/macOS 的符号链接），指向你当前的本地项目目录。
+适用场景：你正在开发一个自己的 Python 包（比如封装了一些工具函数，准备后续发布到 PyPI），需要在本地测试包的功能
+
+    核心优势：是本地代码修改后实时生效，无需重新安装，适合项目开发和二次改造。
+    前提是当前目录存在 setup.py 或 pyproject.toml 打包配置文件，区别于普通安装 pip install .。
+'''
 ```
 安装成功后，即可通过如下方式轻松调用API，传入指定图片（[示例](examples/pokemon.jpeg)）和文本，提取图文特征向量并计算相似度：
 ```python
 import torch 
+# 2. 导入PIL库的Image模块，用于读取、处理图片文件（Python处理图片的基础库）
 from PIL import Image
 
 import cn_clip.clip as clip
@@ -201,16 +212,27 @@ device = "cuda" if torch.cuda.is_available() else "cpu"
 model, preprocess = load_from_name("ViT-B-16", device=device, download_root='./', use_modelscope=True)
 model.eval()
 image = preprocess(Image.open("examples/pokemon.jpeg")).unsqueeze(0).to(device)
+    # unsqueeze()是 PyTorch 中用于给张量「增加一个维度」的函数，0表示「在第 0 个维度（最前面）增加一个维度」。给这个 3 维张量最前面加一个批次维度，批次大小为 1（表示一次处理 1 张图片），将 3 维张量转换成 4 维张量，满足模型的输入格式要求。
+    # 举个直观例子：假设预处理后张量形状是[3, 224, 224]（3 通道、224×224 图片），unsqueeze(0)后形状变成[1, 3, 224, 224]（1 张图片、3 通道、224×224）。
+
 text = clip.tokenize(["杰尼龟", "妙蛙种子", "小火龙", "皮卡丘"]).to(device)
+# to(device)： 模型和输入数据必须位于同一个设备上，否则无法进行计算（会报设备不匹配错误）。比如模型在 GPU 上，数据却在 CPU 上，GPU 无法读取 CPU 的数据进行运算，反之亦然。to(device)的作用就是将张量（数据）转移到指定的设备（和模型保持一致），确保后续模型能够正常处理数据，同时也能利用 GPU 的算力提升运行速度。
 
 with torch.no_grad():
     image_features = model.encode_image(image)
     text_features = model.encode_text(text)
     # 对特征进行归一化，请使用归一化后的图文特征用于下游任务
+    #    dim=-1：沿着特征向量的最后一个维度进行归一化（即特征维度）
     image_features /= image_features.norm(dim=-1, keepdim=True) 
     text_features /= text_features.norm(dim=-1, keepdim=True)    
 
+'''
+logits_per_image：以「图片」为中心，计算每张图片对每段文本的相似度。形状是[图片批次大小, 文本批次大小]，在这段代码中，图片批次大小是 1，文本批次大小是 4，所以形状是[1, 4]，对应「这 1 张图片分别对 4 个文本的相似度」。
+logits_per_text：以「文本」为中心，计算每段文本对每张图片的相似度。形状是[文本批次大小, 图片批次大小]，这段代码中形状是[4, 1]，对应「这 4 个文本分别对 1 张图片的相似度」。
+'''
     logits_per_image, logits_per_text = model.get_similarity(image, text)
+    #    cpu()：将张量从GPU转移到CPU（因为NumPy不支持GPU张量）
+    #    numpy()：将PyTorch张量转换成NumPy数组，方便后续查看和处理
     probs = logits_per_image.softmax(dim=-1).cpu().numpy()
 
 print("Label probs:", probs)  # [[1.268734e-03 5.436878e-02 6.795761e-04 9.436829e-01]]
