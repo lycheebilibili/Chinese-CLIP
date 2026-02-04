@@ -22,7 +22,7 @@
                 "--data_dir",        // 第一个参数名
                 "datapath/datasets/Multimodal_Retrieval", // 第一个参数的值
                 "--splits",          // 第二个参数名
-                "test"   // 第二个参数的值（列表用逗号分隔，作为单个字符串）
+                "train,valid,test"   // 第二个参数的值（列表用逗号分隔，作为单个字符串）
             ]
         }
     ]
