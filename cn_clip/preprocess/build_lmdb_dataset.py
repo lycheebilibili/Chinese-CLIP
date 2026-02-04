@@ -54,17 +54,17 @@ if __name__ == "__main__":
         txn_pairs = env_pairs.begin(write=True)
 
         # write LMDB file storing (image_id, text_id, text) pairs
-        pairs_annotation_path = os.path.join(args.data_dir, "{}_texts.jsonl".format(split))
+        pairs_annotation_path = os.path.join(args.data_dir, "MR_{}_queries.jsonl".format(split))
         with open(pairs_annotation_path, "r", encoding="utf-8") as fin_pairs:
             write_idx = 0
             for line in tqdm(fin_pairs):
                 line = line.strip()
                 obj = json.loads(line)
-                for field in ("text_id", "text", "image_ids"):
+                for field in ("query_id", "query_text", "item_ids"):
                     assert field in obj, "Field {} does not exist in line {}. \
                         Please check the integrity of the text annotation Jsonl file."
-                for image_id in obj["image_ids"]:
-                    dump = pickle.dumps((image_id, obj['text_id'], obj['text'])) # encoded (image_id, text_id, text)
+                for image_id in obj["item_ids"]:
+                    dump = pickle.dumps((image_id, obj['query_id'], obj['query_text'])) # encoded (image_id, text_id, text)
                     txn_pairs.put(key="{}".format(write_idx).encode('utf-8'), value=dump)  
                     write_idx += 1
                     if write_idx % 5000 == 0:
@@ -77,7 +77,7 @@ if __name__ == "__main__":
         print("Finished serializing {} {} split pairs into {}.".format(write_idx, split, lmdb_pairs))
 
         # write LMDB file storing image base64 strings
-        base64_path = os.path.join(args.data_dir, "{}_imgs.tsv".format(split))
+        base64_path = os.path.join(args.data_dir, "MR_{}_imgs.tsv".format(split))
         with open(base64_path, "r", encoding="utf-8") as fin_imgs:
             write_idx = 0
             for line in tqdm(fin_imgs):
