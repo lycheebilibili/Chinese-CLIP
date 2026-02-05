@@ -27,6 +27,44 @@ def parse_args():
     )
     return parser.parse_args()  # 解析并返回参数
 
+def peek_lmdb(input_dir = r"/mnt/e/ProgramExercise/multimodal/Chinese-CLIP/datapath/datasets/Multimodal_Retrieval/lmdb/test/pairs"):
+    input_dir = input_dir.strip()
+    env = lmdb.open(input_dir, readonly=True, lock=False) # lock=False 增加兼容性
+
+    with env.begin() as txn:
+        cursor = txn.cursor()
+        print(f"--- 正在查看文件夹: {input_dir} ---")
+        
+        count = 0
+        # 使用 iternext 同时获取 key 和 value，比单独 get 更快
+        for key, value in cursor.iternext(keys=True, values=True):
+            # 1. 转换 Key 为人类可读
+            k_str = key.decode('utf-8')
+            
+            # 2. 转换 Value 为人类可读
+            if k_str in ["num_samples", "num_images"]:
+                # 如果是统计数值，直接解码
+                v_content = value.decode('utf-8')
+            else:
+                # 如果是图文对，使用 pickle 解码
+                try:
+                    v_content = pickle.loads(value)
+                except:
+                    # 如果读取 imgs 库，可能是 base64 字符串
+                    v_content = value.decode('utf-8')[:50] + "..." 
+
+            print(f"[{count+1}] Key: {k_str}  --->  Value: {v_content}")
+            
+            count += 1
+            if count >= 3: # 只要看前三条
+                break
+        
+        if count == 0:
+            print("警告：数据库是空的！请检查之前的转换脚本是否成功 commit。")
+
+    env.close()
+
+
 if __name__ == "__main__":
     args = parse_args()  # 解析命令行参数
     assert os.path.isdir(args.data_dir), "data_dir 不存在！请检查输入参数..."
@@ -134,3 +172,5 @@ if __name__ == "__main__":
         print("完成序列化 {} {} 分割的图像到 {}。".format(write_idx, split, lmdb_img))
 
     print("完成！")
+    
+    # peek_lmdb(r"/mnt/e/ProgramExercise/multimodal/Chinese-CLIP/datapath/datasets/Multimodal_Retrieval/lmdb/test/pairs")
