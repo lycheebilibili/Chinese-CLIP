@@ -421,12 +421,14 @@ bash run_scripts/muge_finetune_vit-b-16_rbt-base.sh ${DATAPATH}
 相关的训练配置项包括:
 
 + 分布式
-  + `WORKER_CNT`: 训练的机器个数
+  + `WORKER_CNT`: 训练的机器个数（一台机器上可能有多个gpu）
   + `GPUS_PER_NODE`: 每个机器上的GPU个数
 + 训练/验证数据
   + `train-data`: 训练数据LMDB目录，准备LMDB数据文件的预处理流程见上。
   + `val-data`: 验证数据LMDB目录，指定为None时，则不进行训练过程中的验证。
-  + `num-workers`: 训练集数据处理（DataLoader）的进程数，默认为4。
+  + `num-workers`: 训练集数据处理（DataLoader）的进程数，默认为4（和机器 / GPU 无关）。
+
+        作用：CPU 端开启多进程并行加载、预处理数据（比如读取 LMDB 文件、图片解码、文本分词），避免数据加载速度跟不上 GPU 的计算速度（GPU 等数据导致训练卡壳）
   + `valid-num-workers`: 验证集数据处理（DataLoader）的进程数（如果进行验证），默认为1。
 + 训练超参数
   + `vision-model`: 指定视觉backbone, 从 `["ViT-B-16", "ViT-L-14", "ViT-L-14-336", "ViT-H-14", "RN50"]`选择。
@@ -438,14 +440,52 @@ bash run_scripts/muge_finetune_vit-b-16_rbt-base.sh ${DATAPATH}
   + `wd`: weight decay。
   + `max-steps`: 训练步数，也可通过`max-epochs`指定训练轮数。
   + `freeze-vision`: 是否freeze视觉backbone。
+
+        补充：为什么有人会冻结？
+        CLIP 的预训练视觉模型已经学到了通用视觉特征，若你的任务中视觉数据少 / 质量差，冻结视觉模型可以避免过拟合，还能节省显存和计算量；只有当你有足够的专属视觉数据时，才需要解冻一起训。
   + `use-augment`: 是否使用[AutoAugment](https://arxiv.org/abs/1805.09501)对图片进行数据增强。
   + `valid-batch-size`: 验证时单机batch-size。（请保证`验证集样本总数 > batch-size * GPU数`，至少满足1个验证batch）
   + `valid-step-interval`和`valid-epoch-interval`: 验证step/epoch频率，指定为-1时则在训练中不进行验证。
   + `grad-checkpointing`: <span id="checkpointing"></span>使用[重计算策略](https://pytorch.org/docs/stable/checkpoint.html)，在前向过程中不保存中间结果，以训练时间换取更小的显存开销，适用于显存不足的情况。（`store_true`参数，直接在脚本中加上`--grad-checkpointing`即可，目前要求Pytorch>1.8.0）
+
+        还没看相关代码，可能是只保存关键节点结果，丢弃大部分中间结果。反向传播时重新计算需要的中间结果，再算梯度
   + `mask-ratio`: <span id="FLIP"></span>参照[FLIP](https://arxiv.org/abs/2212.00794)的策略，在finetune时可指定随机mask一定比例的图像patch，以降低显存开销、加快训练速度。默认为0.0，即不激活这一策略。
+
+        1. CLIP 的视觉模型（ViT）会把图片切成固定大小的 Patch（比如 ViT-B-16 切成 16×16 的 Patch），然后把这些 Patch 转换成向量输入模型。比如 224×224 的图 → 切成 14×14=196 个 Patch。
+        2. mask-ratio 的原理
+        mask-ratio=0.5 → 随机屏蔽（Mask）50% 的图像 Patch（把这些 Patch 的向量置为 0，或直接丢弃）；
+        只让模型用剩下的 Patch 做训练，反向传播时也只更新未被 Mask 的 Patch 对应的权重。
+        3. 核心作用（为什么这么做？）
+        显存降低：输入模型的 Patch 数量减少，中间特征张量变小，显存占用大幅下降；
+        速度提升：计算量减少（少处理一半 Patch），训练更快；
+        效果几乎不下降：FLIP 论文证明，微调时屏蔽一定比例的 Patch（比如 0.2-0.5），模型效果几乎不变（因为预训练时已经学了足够的视觉特征）
   + `use-flash-attention`: 使用[FlashAttention](https://arxiv.org/abs/2205.14135)，可在不影响效果的条件下为Chinese-CLIP的finetune过程显著提速以及降低显存占用。（`store_true`参数，配置好环境后，在脚本中加上`--use-flash-attention`即可，请详见[flash_attention.md](flash_attention.md)）
   + `accum-freq`: <span id="gradient_accumulation"></span>梯度累积频率，默认为1。指定为大于1的整数时开启对比学习梯度累积，模拟更大的batch size。如果单卡batch size为`m`，则总的batch size为`accum_freq * m * GPU数`。
   + `gather-with-grad`: 是否在分布式训练时进行带有完整梯度的特征gather，默认关闭。
+
+        . 什么是 “特征 Gather”？
+        CLIP 的训练是对比学习（图文匹配），需要计算 “全局的图文相似度矩阵”—— 但分布式训练时，每个 GPU 只持有一部分样本的特征（比如 8 卡训练，每卡只有 1/8 的样本）。“Gather” 就是把所有 GPU 上的特征收集到一起，拼成完整的特征矩阵，才能计算正确的对比损失。
+2. gather-with-grad 的核心区别
+
+
+| 状态 | 特征Gather时是否带梯度 | 适用场景 | 影响 |
+|------|----------------------|---------|------|
+| 关闭（默认） | 只收集特征值，梯度丢失 | 只求损失，不求全局梯度 | 显存占用低，但梯度计算不完整 |
+| 开启（--gather-with-grad） | 收集特征 + 保留梯度 | 需要全局梯度更新 | 显存占用高，但梯度更准确 |
+
+    通俗解释：
+
+    关闭时：每个 GPU 只算自己那部分样本的梯度，全局特征只是 “临时用一下算损失”，梯度不回传；
+
+    开启时：全局特征的梯度会完整回传，模型更新更准确，但需要更多显存来存储全局梯度。
+
+    另一种解释（gemini）：
+    ============"With Grad" 的核心含义===============
+    在 PyTorch 的分布式环境（DDP）中，标准的 all_gather 操作通常是脱离计算图的。
+
+    没有 Gather-with-grad： 显卡 A 拿到显卡 B 的特征时，这些特征被视为“常量”。计算 Loss 后，梯度只能回传给显卡 A 本身的模型参数，而无法跨越网络回传给显卡 B。
+
+    有了 Gather-with-grad： 通过自定义 torch.autograd.Function，显卡 A 在拿到显卡 B 的特征后，依然保留了梯度路径。这意味着显卡 A 的 Loss 可以对显卡 B 上的模型参数产生贡献。
 + 输出选项
   + `name`: 指定输出路径。超参日志, 训练日志以及产出ckpt均会存放至 `${DATAPATH}/experiments/${name}/`。
   + `save-step-frequency`及`save-epoch-frequency`: 存ckpt的步数或轮数间隔。
@@ -453,7 +493,64 @@ bash run_scripts/muge_finetune_vit-b-16_rbt-base.sh ${DATAPATH}
 + 权重读取相关选项
   + `resume`: 权重读取的路径。示例脚本中指定为预训练ckpt路径，也可以指定为用户自己finetune的ckpt路径做继续训练。
   + `reset-data-offset`: 是否从此前的数据断点续跑。如batch size或GPU卡数超参改变，建议打开此选项。
+
+        重置数据读取进度：
+        深度学习训练时，数据加载器（DataLoader）会记录当前读到了第几个样本（即 Offset）。如果你从第 100 个 Epoch 的一半停止，下次启动时，默认会从这“一半”的位置继续读，以保证数据不重不漏。
+
+        为什么要重置（Reset）： 数据的索引（Index）通常是根据 Batch Size × GPU数量 计算出来的。
+
+        如果你改变了 GPU 数量或 Batch Size，原来的 Offset 逻辑就会发生错位（例如：原来的第 1000 步对应的是第 80000 个样本，但新配置下第 1000 步可能对应第 160000 个样本）。
+
+        如果不重置，可能会导致程序报错、数据跳过或重复读取。
+
   + `reset-optimizer`: 是否使用optimizer state。
+        
+        优化器状态的重置
+        意思： 优化器（如 Adam, Lamb）不仅保存模型的权重（Weights），还保存了每个参数的“动量”（Momentum）和“二阶矩”（Variance）。这些统称为 Optimizer State。
+
+        为什么要重置（Reset）： * 如果你开启，模型会从 Checkpoint 加载权重，但会丢弃之前的动量信息，像新模型一样从头计算梯度累积。
+
+            - 如果你不开启（默认做法），优化器会恢复到停止那一刻的状态，实现真正的“无损续接”。
+
+
+        场景建议：我该怎么做？
+    根据你的具体目的，请参考以下操作方案：
+
+    场景 A：纯粹的故障恢复（断电、任务超时）
+    前提： GPU 数量、Batch Size、学习率等所有参数完全没变。
+
+    操作： * reset-data-offset: 不要打开（让它从断点继续跑）。
+
+    reset-optimizer: 不要打开（保留优化器状态，保证训练曲线平滑）。
+
+    场景 B：微调（Fine-tuning）或迁移学习
+    前提： 你加载了一个预训练模型（Checkpoint），但在新数据集上跑。
+
+    操作：
+
+    reset-data-offset: 必须打开（因为是新数据，Offset 没意义）。
+
+    reset-optimizer: 建议打开（预训练模型的优化器状态通常对新任务没有帮助，甚至会有负面影响）。
+
+    场景 C：修改了硬件配置（重点！）
+    前提： 比如从 8 卡变成了 16 卡，或者为了防止显存溢出改小了 batch-size。
+
+    操作：
+
+    reset-data-offset: 必须打开（避免分布式数据读取出错）。
+
+    reset-optimizer: 视情况而定。
+
+    如果你希望训练尽量连续，可以尝试不重置。
+
+    但如果修改配置后训练变得不稳定（Loss 抖动剧烈），则需要打开 reset-optimizer 并配合较小的学习率进行 Warmup。
+
+    场景 D：训练已经收敛，想追加训练 Epoch
+    操作：
+
+    reset-data-offset: 打开（因为上一轮数据已经跑完了，需要从头开始 Shuffle）。
+
+    reset-optimizer: 不要打开（保留动量有助于平滑地继续收敛）
 
 训练完毕，log 会自动存在`${DATAPATH}/experiments/${name}/out_${timestamp}.log`，训练log格式如下所示:
 ```
@@ -473,14 +570,44 @@ bash run_scripts/muge_finetune_vit-b-16_rbt-base.sh ${DATAPATH}
 #### 图文特征提取
 
 目前本代码支持使用GPU单卡进行图文特征提取，请参考使用以下命令。我们也提供了部署ONNX和TensorRT模型，加速特征推理的支持，详见[deployment.md](deployment.md)。
+
+- ONNX (Open Neural Network Exchange)：可以理解为一个中间协议。它的作用： 解决框架之间的隔阂。以前你用 PyTorch 写的模型很难直接跑在 TensorFlow 上。有了 ONNX，你可以把 PyTorch 模型导出为 .onnx 文件，然后这个文件就可以在任何支持 ONNX 的环境下运行。
+
+    核心特性：
+
+    跨平台： 无论你用什么框架训练，都可以转成 ONNX。
+
+    静态图化： 它将模型中的操作（如卷积、池化）标准化，形成一个固定的计算图。
+
+    比喻： 它是模型界的 PDF。无论你用 Word 还是 Pages 写的文档，存成 PDF 后，别人都能打开看，且格式不会乱。
+- TensorRT：TensorRT 是 NVIDIA 推出的一个高性能深度学习推理（Inference）优化库。
+
+    它是怎么加速的？
+
+    算子融合（Layer Fusion）： 把多个小的计算步骤合并成一个大的步骤（比如把卷积、偏置和激活函数合成一步完成），减少 GPU 读写次数。
+
+    精度校准： 把模型从 FP32（高精度）转为 FP16 甚至 INT8（低精度），虽然精度损失极小，但速度能提升好几倍。
+
+    显存优化： 自动寻找在当前这块显卡上运行最快的算法。
+
+
+
 ```bash
 cd Chinese-CLIP/
+# export CUDA_VISIBLE_DEVICES=0: 环境变量设置，指定只使用编号为 0 的显卡（GPU）。
+# export PYTHONPATH=...: 将当前目录下的 cn_clip 文件夹加入 Python 搜索路径，确保代码能找到对应的模块。
 export CUDA_VISIBLE_DEVICES=0
 export PYTHONPATH=${PYTHONPATH}:`pwd`/cn_clip
 
 split=valid # 指定计算valid或test集特征
 resume=${DATAPATH}/pretrained_weights/clip_cn_vit-b-16.pt
 
+"""
+脚本的行为是：使用 0 号显卡，加载 clip_cn_vit-b-16.pt 预训练权重，对指定路径下的 LMDB 图像数据和 JSONL 文本数据进行特征提取，Batch Size 设为 32.
+
+这里讲的特征提取的意思可以理解为：转化为向量。
+"""
+# -u: --unbuffered 的缩写，强制 Python 不使用缓冲区，直接把日志打印到屏幕（防止程序崩了但看不到报错）
 python -u cn_clip/eval/extract_features.py \
     --extract-image-feats \
     --extract-text-feats \
@@ -506,6 +633,10 @@ python -u cn_clip/eval/extract_features.py \
 #### KNN检索
 
 对于小规模的学术检索数据集，我们提供一个简单的KNN检索实现，便于计算文到图、图到文检索的top-k召回结果（tips：如想仿照我们在项目中搭建[检索demo](https://www.modelscope.cn/studios/damo/chinese_clip_applications/summary)，建议基于中文CLIP模型产出图文特征后，结合开源工程框架[clip-retrieval](https://github.com/rom1504/clip-retrieval)搭建前后端服务。）
+
+- （解释：KNN 的全称是 K-Nearest Neighbors，翻译过来就是 “K 个最近邻居”。
+
+    在 CLIP 的场景下，KNN 检索的意思就是：在向量空间里，寻找离你给定的目标向量最近的那 K 个向量。）
 
 对于文到图检索（文本召回相关图片），请运行以下命令：
 ```bash
